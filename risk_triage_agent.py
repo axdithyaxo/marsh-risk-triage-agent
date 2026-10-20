@@ -46,13 +46,14 @@ Run:
     python risk_triage_agent.py
 """
 
+import json
 import os
 import re
 import sys
 
 sys.path.insert(0, "/Users/aadithya/Desktop/Lar_Main/lar/src")
 
-from lar.node import BaseNode, HumanJuryNode
+from lar.node import BaseNode, HumanJuryNode, LLMNode, ToolNode
 from lar.state import GraphState
 from lar.executor import GraphExecutor
 from lar.compliance import (
@@ -91,19 +92,39 @@ class SubmissionIntakeNode(BaseNode):
 
     def execute(self, state: GraphState):
         print("\n[SubmissionIntakeNode] Processing new risk submission...")
-        state.set("processed_submission", state.get("raw_submission"))
+        submission = state.get("raw_submission")
+        # Stress-testing found this uncaught: an empty, whitespace-only, or
+        # entirely missing submission used to flow straight through and
+        # get silently approved (BIND) as if it were legitimate low-risk
+        # content. Reject it here instead of pretending there's a risk
+        # profile to assess.
+        if not submission or not str(submission).strip():
+            raise ValueError(
+                "Empty or missing submission -- nothing to assess. "
+                "Rejected before reaching risk assessment, not silently approved."
+            )
+        state.set("processed_submission", submission)
         return self.next_node
 
 
 class PIIRedactionNode(BaseNode):
     """Wraps PIIRedactionEngine into a graph node -- same pattern as
-    examples/compliance/28_eu_ai_act_loan_underwriter.py's PIIRedactionNode."""
+    examples/compliance/28_eu_ai_act_loan_underwriter.py's PIIRedactionNode.
+
+    Honest scope, found by stress-testing, not assumed: this redacts PPSN,
+    phone, and email via regex, which is reliable because those have a
+    fixed format. Full name and street address do NOT have a fixed format
+    -- catching those reliably needs a real NER-based PII detector, not a
+    regex list. That's a known, documented limitation of this demo, not a
+    silently-hidden one: a name or address in a submission will NOT be
+    redacted by this node."""
     def __init__(self, sensitive_keys, next_node=None):
         self.engine = PIIRedactionEngine(sensitive_keys=sensitive_keys)
         self.next_node = next_node
 
     def execute(self, state: GraphState):
-        print("[PIIRedactionNode] Redacting claimant/policyholder PII...")
+        print("[PIIRedactionNode] Redacting claimant/policyholder PII "
+              "(PPSN, phone, email -- NOT name/address, see class docstring)...")
         text = state.get("raw_submission", "")
         for key in self.engine.sensitive_keys:
             if key == "ppsn":
@@ -111,25 +132,33 @@ class PIIRedactionNode(BaseNode):
                 text = re.sub(r"\b\d{7}[A-Za-z]{1,2}\b", "[REDACTED PPSN]", text)
             if key == "phone":
                 text = re.sub(r"\b0\d{1,2}[\s-]?\d{3}[\s-]?\d{4}\b", "[REDACTED PHONE]", text)
+            if key == "email":
+                text = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", "[REDACTED EMAIL]", text)
         state.set("raw_submission", text)
         return self.next_node
 
 
-class RiskAssessmentNode(BaseNode):
+class SimulatedRiskAssessmentNode(BaseNode):
     """
-    Simulates the model-backed risk-assessment step (same honest
-    simulation convention as LLMLoanDecisionNode in the Lár loan-underwriter
-    example -- deterministic, reproducible, no external API dependency
-    required to run this demo). In a real deployment this is an LLMNode
-    call; the simulation keeps the compliance topology around it identical
-    either way, which is the actual point of this demo.
+    The original honest simulation (same convention as LLMLoanDecisionNode
+    in the Lár loan-underwriter example): deterministic, reproducible, no
+    external dependency required to run this demo. Kept as a fallback path
+    -- build_risk_triage_agent(use_llm=False) uses this instead of the real
+    model below.
+
+    Stress-testing confirmed this exact limitation, twice, independently:
+    naive substring matching cannot understand negation. "This property is
+    NOT in a flood zone" still matches "flood" and gets flagged REFER. The
+    real LLMNode-backed RiskAssessmentPrompt below exists specifically to
+    fix that, verified by actually running the same negation test against
+    it, not assumed to be better just because it's a bigger model.
     """
     def __init__(self, next_node=None):
         self.next_node = next_node
 
     def execute(self, state: GraphState):
         text = str(state.get("processed_submission", "")).lower()
-        print("[RiskAssessmentNode] Assessing submission...")
+        print("[SimulatedRiskAssessmentNode] Assessing submission (keyword simulation)...")
 
         if "flood" in text or "subsidence" in text:
             decision = "REFER: elevated environmental risk factors present, requires surveyor review."
@@ -147,6 +176,71 @@ class RiskAssessmentNode(BaseNode):
         return self.next_node
 
 
+# --- Real LLM-backed risk assessment ---
+# Calls a real local model (default: qwen2.5:14b via Ollama) instead of
+# keyword matching. Two nodes, same pattern as
+# examples/patterns/4_structured_output.py: the LLMNode asks for strict
+# JSON, a ToolNode parses it and merges the result into state.
+
+RISK_ASSESSMENT_PROMPT = """You are a first-pass property risk triage assistant for an insurance company. Read the submission below and assess it.
+
+Submission: {processed_submission}
+
+Return STRICTLY VALID JSON with exactly these keys:
+  "decision": either "BIND" (standard risk, recommend approving) or "REFER" (elevated risk, recommend a human underwriter reviews it)
+  "confidence": a number between 0 and 1, your confidence in this assessment
+  "reason": one sentence explaining the decision
+
+Pay close attention to negation: a property explicitly described as NOT in a flood zone, or with NO history of a given risk factor, must NOT be treated as risky for that factor just because the word appears in the text.
+
+No markdown code blocks, no extra text outside the JSON object, JSON only."""
+
+
+def build_llm_risk_assessment_nodes(model_name: str = "ollama/qwen2.5:14b"):
+    llm = LLMNode(
+        model_name=model_name,
+        prompt_template=RISK_ASSESSMENT_PROMPT,
+        output_key="raw_risk_json",
+        system_instruction="You are a precise, literal reader. You never let a keyword override what the sentence actually says.",
+    )
+
+    def parse_risk_json(state):
+        raw = state.get("raw_risk_json", "{}")
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        try:
+            data = json.loads(raw)
+            decision = str(data.get("decision", "REFER")).strip().upper()
+            confidence = float(data.get("confidence", 0.5))
+            reason = str(data.get("reason", "No reason returned by model.")).strip()
+            if decision not in ("BIND", "REFER"):
+                # Model didn't follow the format -- fail safe to REFER
+                # rather than silently guessing BIND.
+                decision = "REFER"
+                reason = f"Unparseable decision value from model, failing safe to REFER. Raw: {raw[:200]}"
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            # The model didn't return valid JSON -- same fail-safe
+            # principle: an unparseable response is NOT a clean BIND.
+            decision, confidence = "REFER", 0.0
+            reason = f"Could not parse model output as JSON ({e}), failing safe to REFER. Raw: {raw[:200]}"
+
+        print(f"[RiskAssessmentNode-LLM] {decision} (confidence={confidence:.2f}): {reason}")
+        return {
+            "risk_decision": f"{decision}: {reason}",
+            "model_confidence": confidence,
+            "action_type": "PROPERTY_RISK_SUBMISSION",
+        }
+
+    parser = ToolNode(
+        tool_function=parse_risk_json,
+        input_keys=["__state__"],
+        output_key=None,  # merges the returned dict into state directly
+        next_node=None,
+    )
+
+    llm.next_node = parser
+    return llm, parser
+
+
 class FinalDecisionNode(BaseNode):
     def __init__(self, next_node=None):
         self.next_node = next_node
@@ -158,7 +252,13 @@ class FinalDecisionNode(BaseNode):
 
 # --- 3. Construct the graph ---
 
-def build_risk_triage_agent():
+def build_risk_triage_agent(use_llm: bool = True, model_name: str = "ollama/qwen2.5:14b"):
+    """
+    use_llm=True (default): real risk assessment via a local LLM call
+    (qwen2.5:14b over Ollama by default). use_llm=False: falls back to the
+    original deterministic keyword simulation, no model dependency needed
+    -- useful if Ollama isn't reachable.
+    """
     ledger = AuthorityLedger()
 
     transparency_node = DeployerTransparencyNode(
@@ -170,7 +270,7 @@ def build_risk_triage_agent():
         conformity_id="MARSH-DEMO-RISK-TRIAGE-2026",
     )
 
-    pii_redactor = PIIRedactionNode(sensitive_keys=["ppsn", "phone"])
+    pii_redactor = PIIRedactionNode(sensitive_keys=["ppsn", "phone", "email"])
 
     injection_guard = PromptInjectionGuard(
         input_keys=["raw_submission"],
@@ -178,7 +278,6 @@ def build_risk_triage_agent():
     )
 
     intake = SubmissionIntakeNode()
-    assessment = RiskAssessmentNode()
     final = FinalDecisionNode(next_node=None)
 
     jury = HumanJuryNode(
@@ -193,8 +292,14 @@ def build_risk_triage_agent():
     transparency_node.next_node = pii_redactor
     pii_redactor.next_node = injection_guard
     injection_guard.next_node = intake
-    intake.next_node = assessment
-    assessment.next_node = scorer
+
+    if use_llm:
+        assessment_start, assessment_end = build_llm_risk_assessment_nodes(model_name=model_name)
+    else:
+        assessment_start = assessment_end = SimulatedRiskAssessmentNode()
+
+    intake.next_node = assessment_start
+    assessment_end.next_node = scorer
 
     return transparency_node, ledger
 
