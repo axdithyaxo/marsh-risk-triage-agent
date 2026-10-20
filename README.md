@@ -39,12 +39,12 @@ existing Lár code:
 
 | Primitive | What it does here |
 |---|---|
-| `PIIRedactionEngine` | Redacts claimant PII (PPSN, phone) before anything else touches the submission |
-| `PromptInjectionGuard` | Blocks adversarial content in untrusted external submissions |
-| `ActionPolicy` / `PolicyRegistry` / `RiskScorerNode` | Registers risk tier, reversibility, and required oversight level for this action class, and dynamically routes to human review |
-| `HumanJuryNode` | The actual human-in-the-loop escalation path |
+| `PIIRedactionEngine` | Supplies the field list (PPSN, phone, email); the actual redaction is custom regex, same pattern as Lár's own loan-underwriter example — see note below |
+| `PromptInjectionGuard` | Blocks adversarial content matching a fixed heuristic list before it reaches the model |
+| `ActionPolicy` / `PolicyRegistry` / `RiskScorerNode` | Registers risk tier, reversibility, and required oversight level per action type, and dynamically escalates to human review based on live model confidence |
+| `HumanJuryNode` | The actual human-in-the-loop escalation path, wired to `AuthorityLedger` so every real decision is recorded automatically |
 | `DeployerTransparencyNode` | Generates real instructions-for-use documentation |
-| `AuthorityLedger` | Records who/what authorised each step |
+| `AuthorityLedger` | Records every human authority exercise (stakeholder, decision, rationale) and saves an HMAC-signed `authority_ledger.json` |
 | `GraphExecutor(hmac_secret=...)` | Signs the full execution log with HMAC-SHA256 |
 
 The closest existing precedent in Lár's own test suite is
@@ -83,11 +83,36 @@ where my own predictions were wrong, not cherry-picked:
   address are NOT redacted — those don't have a fixed format a regex can
   reliably catch; doing that properly needs a real NER-based PII
   detector, not a regex list.
-- **A place I was wrong, reported rather than dropped:** I expected the
-  prompt-injection guard might be brittle, matching only the exact phrase
-  "ignore all previous instructions." It wasn't — it also caught a
-  paraphrased attempt ("disregard your prior guidance...") and caught the
-  injection even buried inside otherwise-legitimate risk content.
+- **A place I was wrong, corrected after reading the real source, not
+  left as-is:** I initially reported the prompt-injection guard as "more
+  robust than expected" because it also caught a paraphrased attempt
+  ("disregard your prior guidance..."). Reading `prompt_injection_guard.py`
+  directly showed why: it's a fixed list of 7 known phrases
+  ("ignore all previous instructions", "disregard", "override", etc.),
+  substring-matched — "disregard" is simply one of the seven. It's not
+  smarter than expected, the test phrase happened to contain a listed
+  word. A differently-worded attempt avoiding all seven would not be
+  caught. Correcting my own earlier claim here rather than letting it
+  stand uncorrected.
+- **Found by reading the real `RiskScorerNode` source, then fixed:**
+  `model_confidence` was being logged but never actually changed the
+  outcome, because the main scenario's policy is pinned at the maximum
+  oversight tier (`PRE_EXECUTION`) and `reversibility=False`
+  independently forces that same tier — correctly, since an irreversible
+  decision shouldn't get less oversight just because the model sounds
+  confident. To demonstrate the real escalation logic honestly rather
+  than fake it on the main scenario, a second, genuinely reversible
+  action type (`DRAFT_CLIENT_COMMUNICATION`, `oversight_level=REALTIME`)
+  shows it directly: confidence 0.95 goes straight through with no human
+  gate; confidence 0.40, same action type, escalates to `PRE_EXECUTION`
+  and is verified to actually route through `HumanJuryNode` — checked
+  against the real list of nodes visited, not just a printed label.
+- **Found and fixed:** `HumanJuryNode` has a real, built-in
+  `authority_ledger` integration that records every decision automatically
+  — it just was never wired up. Fixed by passing `authority_ledger=ledger`
+  with a real stakeholder role; the ledger is also now constructed with
+  its own `hmac_secret` and actually saved, so `authority_ledger.json` is
+  a genuine signed file, not an unused object that only lived in memory.
 - No crashes anywhere — including a 5000-word input and mixed-language/
   unicode input.
 - The model fails safe: if its response isn't valid JSON, or doesn't
